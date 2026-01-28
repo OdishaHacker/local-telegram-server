@@ -4,13 +4,13 @@ const axios = require("axios");
 const fs = require("fs");
 const FormData = require("form-data");
 const session = require("express-session");
-const crypto = require("crypto");
 const path = require("path");
 
 const app = express();
+
 const upload = multer({
   dest: "/tmp",
-  limits: { fileSize: 5 * 1024 * 1024 * 1024 } // 5GB
+  limits: { fileSize: 2 * 1024 * 1024 * 1024 } // 2GB Telegram limit
 });
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
@@ -20,9 +20,6 @@ const BASE_URL = process.env.BASE_URL;
 const ADMIN_USER = "admin";
 const ADMIN_PASS = "12345";
 
-const progressMap = {};
-const fileMap = {}; // token => { parts: [file_id], name }
-
 app.use(express.urlencoded({ extended: true }));
 app.use(session({
   secret: "tg-storage",
@@ -30,28 +27,28 @@ app.use(session({
   saveUninitialized: false
 }));
 
-/* ========== AUTH ========== */
+/* ================= AUTH ================= */
 function auth(req, res, next) {
   if (!req.session.user) return res.redirect("/login");
   next();
 }
 
-/* ========== LOGIN ========== */
+/* ================= LOGIN ================= */
 app.get("/login", (_, res) => {
   res.send(`
-  <style>
-  body{background:#020617;color:#fff;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh}
-  .box{background:#020617;padding:30px;border-radius:14px;width:280px}
-  input,button{width:100%;margin-top:10px;padding:10px;border-radius:8px;border:none}
-  button{background:#22c55e;font-weight:bold}
-  </style>
-  <form class="box" method="POST">
-  <h2>Login</h2>
-  <input name="username" placeholder="Username" required>
-  <input name="password" type="password" placeholder="Password" required>
-  <button>Login</button>
-  </form>
-  `);
+<style>
+body{background:#020617;color:#fff;font-family:sans-serif;display:flex;justify-content:center;align-items:center;height:100vh}
+.box{background:#020617;padding:30px;border-radius:14px;width:280px}
+input,button{width:100%;margin-top:10px;padding:10px;border-radius:8px;border:none}
+button{background:#22c55e;font-weight:bold}
+</style>
+<form class="box" method="POST">
+<h2>Login</h2>
+<input name="username" required placeholder="Username">
+<input type="password" name="password" required placeholder="Password">
+<button>Login</button>
+</form>
+`);
 });
 
 app.post("/login", (req, res) => {
@@ -59,14 +56,14 @@ app.post("/login", (req, res) => {
     req.session.user = true;
     return res.redirect("/");
   }
-  res.send("❌ Wrong login");
+  res.send("❌ Invalid login");
 });
 
 app.get("/logout", (req, res) => {
   req.session.destroy(() => res.redirect("/login"));
 });
 
-/* ========== UI ========== */
+/* ================= UI ================= */
 app.get("/", auth, (_, res) => {
   res.send(`
 <!DOCTYPE html>
@@ -79,8 +76,8 @@ body{background:#020617;color:#e5e7eb;font-family:sans-serif}
 button{background:#22c55e;border:none;padding:12px;width:100%;border-radius:12px;font-weight:bold}
 input{width:100%;margin:12px 0}
 .progress{height:8px;background:#1e293b;border-radius:10px;overflow:hidden}
-.bar{height:8px;width:0%;background:linear-gradient(90deg,#22c55e,#4ade80);transition:width .25s}
-small{opacity:.7}
+.bar{height:8px;width:0;background:linear-gradient(90deg,#22c55e,#4ade80)}
+small{opacity:.8}
 a{color:#38bdf8;word-break:break-all}
 </style>
 </head>
@@ -92,7 +89,7 @@ a{color:#38bdf8;word-break:break-all}
 <button>Upload</button>
 </form>
 <div class="progress"><div class="bar" id="bar"></div></div>
-<small id="percent"></small>
+<small id="info"></small>
 <div id="result"></div>
 <br><a href="/logout">Logout</a>
 </div>
@@ -100,29 +97,33 @@ a{color:#38bdf8;word-break:break-all}
 <script>
 const form=document.getElementById("form");
 const bar=document.getElementById("bar");
-const percent=document.getElementById("percent");
+const info=document.getElementById("info");
 const result=document.getElementById("result");
 
 form.onsubmit=e=>{
 e.preventDefault();
 bar.style.width="0%";
-percent.textContent="Starting...";
+info.textContent="Starting...";
 result.innerHTML="";
 
-const fd=new FormData(form);
-fetch("/upload",{method:"POST",body:fd})
-.then(r=>r.json())
-.then(d=>{
-const es=new EventSource("/progress/"+d.token);
-es.onmessage=e=>{
-bar.style.width=e.data+"%";
-percent.textContent=e.data+"%";
-if(e.data>=100){
-es.close();
-result.innerHTML='<a href="'+d.download+'" target="_blank">⬇ Download File</a>';
+const data=new FormData(form);
+const xhr=new XMLHttpRequest();
+const start=Date.now();
+
+xhr.upload.onprogress=e=>{
+if(e.lengthComputable){
+const percent=(e.loaded/e.total*100).toFixed(1);
+bar.style.width=percent+"%";
+
+const time=(Date.now()-start)/1000;
+const speed=(e.loaded/1024/1024/time).toFixed(2);
+info.textContent=\`\${percent}% • \${speed} MB/s\`;
 }
 };
-});
+
+xhr.onload=()=>result.innerHTML=xhr.responseText;
+xhr.open("POST","/upload");
+xhr.send(data);
 };
 </script>
 </body>
@@ -130,65 +131,54 @@ result.innerHTML='<a href="'+d.download+'" target="_blank">⬇ Download File</a>
 `);
 });
 
-/* ========== PROGRESS STREAM ========== */
-app.get("/progress/:id", auth, (req, res) => {
-  res.setHeader("Content-Type", "text/event-stream");
-  const t=req.params.id;
-  const i=setInterval(()=>{
-    res.write(`data: ${progressMap[t]||0}\n\n`);
-    if(progressMap[t]>=100){clearInterval(i);res.end();}
-  },300);
-});
-
-/* ========== UPLOAD (CHUNKED INTERNAL) ========== */
+/* ================= UPLOAD ================= */
 app.post("/upload", auth, upload.single("file"), async (req, res) => {
-  const token=crypto.randomUUID();
-  progressMap[token]=0;
-  fileMap[token]={parts:[],name:req.file.originalname};
+  try {
+    const form = new FormData();
+    form.append("chat_id", CHANNEL_ID);
+    form.append("document", fs.createReadStream(req.file.path), req.file.originalname);
 
-  const CHUNK=20*1024*1024; // 20MB
-  const size=fs.statSync(req.file.path).size;
-  const total=Math.ceil(size/CHUNK);
-
-  const fd=fs.openSync(req.file.path,"r");
-  for(let i=0;i<total;i++){
-    const buf=Buffer.alloc(Math.min(CHUNK,size-i*CHUNK));
-    fs.readSync(fd,buf,0,buf.length,i*CHUNK);
-
-    const f=new FormData();
-    f.append("chat_id",CHANNEL_ID);
-    f.append("document",buf,{filename:req.file.originalname+".part"+i});
-
-    const tg=await axios.post(
+    const tg = await axios.post(
       `https://api.telegram.org/bot${BOT_TOKEN}/sendDocument`,
-      f,{headers:f.getHeaders(),maxBodyLength:Infinity}
+      form,
+      { headers: form.getHeaders(), maxBodyLength: Infinity }
     );
 
-    fileMap[token].parts.push(tg.data.result.document.file_id);
-    progressMap[token]=Math.floor(((i+1)/total)*100);
-  }
-  fs.unlinkSync(req.file.path);
+    fs.unlinkSync(req.file.path);
 
-  res.json({
-    token,
-    download:`${BASE_URL}/download/${token}`
-  });
+    const fileId = tg.data.result.document.file_id;
+    const name = tg.data.result.document.file_name;
+
+    const link = `${BASE_URL}/download/${fileId}?name=${encodeURIComponent(name)}`;
+
+    res.send(`
+<p>✅ Upload Success</p>
+<a href="${link}" target="_blank">${link}</a>
+<br><button onclick="navigator.clipboard.writeText('${link}')">Copy Link</button>
+`);
+  } catch {
+    res.send("❌ Upload Failed");
+  }
 });
 
-/* ========== DOWNLOAD (MERGED STREAM) ========== */
-app.get("/download/:token", async (req,res)=>{
-  const info=fileMap[req.params.token];
-  if(!info) return res.send("Invalid link");
+/* ================= DOWNLOAD ================= */
+app.get("/download/:id", async (req, res) => {
+  try {
+    const fileId = req.params.id;
+    const name = req.query.name || "file";
 
-  res.setHeader("Content-Disposition",`attachment; filename="${info.name}"`);
+    const tg = await axios.get(
+      `https://api.telegram.org/bot${BOT_TOKEN}/getFile?file_id=${fileId}`
+    );
 
-  for(const fid of info.parts){
-    const f=await axios.get(`https://api.telegram.org/bot${BOT_TOKEN}/getFile?file_id=${fid}`);
-    const url=`https://api.telegram.org/file/bot${BOT_TOKEN}/${f.data.result.file_path}`;
-    const s=await axios({url,responseType:"stream"});
-    await new Promise(r=>s.data.pipe(res,{end:false}).on("end",r));
+    const url = `https://api.telegram.org/file/bot${BOT_TOKEN}/${tg.data.result.file_path}`;
+    const stream = await axios({ url, responseType: "stream" });
+
+    res.setHeader("Content-Disposition", `attachment; filename="${name}"`);
+    stream.data.pipe(res);
+  } catch {
+    res.send("❌ Download Failed");
   }
-  res.end();
 });
 
-app.listen(5000,()=>console.log("🔥 Telegram Storage Live"));
+app.listen(5000, () => console.log("🔥 Telegram Storage Running"));
